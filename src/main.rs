@@ -1,47 +1,135 @@
 use std::sync::{Arc, Mutex};
-use std::collections::VecDeque;
 use std::thread;
 use std::time::{Duration, Instant};
 
-// 1. 任务队列结构 [cite: 431]
-struct TaskQueue {
-    tasks: Mutex<VecDeque<String>>,
-}
+use project_blaze::monitor::{spawn_monitor_thread, HealthMonitor};
+use project_blaze::robot::{spawn_robot, RobotBehavior, RobotWorkerConfig};
+use project_blaze::task::{CompletedTask, Task, TaskKind};
+use project_blaze::task_queue::TaskQueue;
+use project_blaze::types::{RobotStatus, SimulationConfig};
+use project_blaze::zone::ZoneManager;
 
-// 2. 区域访问控制 [cite: 432]
-struct ZoneControl {
-    occupied: Mutex<bool>,
-}
-
-// 3. 健康监测系统 [cite: 433]
-struct HealthMonitor {
-    last_heartbeat: Mutex<Instant>,
-}
+const ROBOT_COUNT: u32 = 3;
 
 fn main() {
-    // 使用 Arc 包装，以便在多个机器人（线程）之间安全共享状态 [cite: 426, 472]
-    let task_queue = Arc::new(TaskQueue {
-        tasks: Mutex::new(VecDeque::from([
-            "Disinfect Ward A".to_string(),
-            "Deliver Medicine to B".to_string(),
-        ])),
-    });
+    let config = SimulationConfig {
+        heartbeat_interval: Duration::from_millis(200),
+        monitor_poll_interval: Duration::from_millis(150),
+        heartbeat_timeout: Duration::from_millis(700),
+        task_execution_duration: Duration::from_millis(350),
+        zone_retry_duration: Duration::from_millis(120),
+        idle_sleep_duration: Duration::from_millis(75),
+    };
 
-    let zone = Arc::new(ZoneControl { occupied: Mutex::new(false) });
-    let monitor = Arc::new(HealthMonitor { last_heartbeat: Mutex::new(Instant::now()) });
+    let tasks = vec![
+        Task::new(1, "Zone-A", TaskKind::Delivery),
+        Task::new(2, "Zone-A", TaskKind::Disinfection),
+        Task::new(3, "Zone-B", TaskKind::SurgicalAssist),
+        Task::new(4, "Zone-A", TaskKind::Delivery),
+        Task::new(5, "Zone-C", TaskKind::Disinfection),
+        Task::new(6, "Zone-B", TaskKind::Delivery),
+    ];
+    let total_tasks = tasks.len();
 
-    println!("Medical Care Robot System Starting...");
+    let task_queue = Arc::new(TaskQueue::from_tasks(tasks));
+    let zone_manager = Arc::new(ZoneManager::new([
+        "Zone-A".to_string(),
+        "Zone-B".to_string(),
+        "Zone-C".to_string(),
+    ]));
+    let monitor = Arc::new(HealthMonitor::new(config.heartbeat_timeout));
+    let completed_tasks: Arc<Mutex<Vec<CompletedTask>>> = Arc::new(Mutex::new(Vec::new()));
+    let shutdown = Arc::new(Mutex::new(false));
 
-    // 模拟一个机器人线程 [cite: 439]
-    let t_task_queue = Arc::clone(&task_queue);
-    let robot_thread = thread::spawn(move || {
-        if let Some(task) = t_task_queue.tasks.lock().unwrap().pop_front() {
-            println!("Robot 1 started: {}", task);
-            // 模拟心跳更新 [cite: 441, 470]
-            thread::sleep(Duration::from_secs(1));
+    println!("Project Blaze: Medical Care Robot Coordination System");
+    println!("----------------------------------------------------");
+    println!("Robots: {ROBOT_COUNT}, tasks: {total_tasks}");
+    println!("Contention demo: multiple tasks target Zone-A");
+    println!("Timeout demo: robot 3 stops heartbeating after a few heartbeats");
+    println!();
+
+    let monitor_handle = spawn_monitor_thread(
+        Arc::clone(&monitor),
+        Arc::clone(&shutdown),
+        config.monitor_poll_interval,
+        true,
+    );
+
+    let robot_handles: Vec<_> = (1..=ROBOT_COUNT)
+        .map(|robot_id| {
+            let behavior = if robot_id == 3 {
+                RobotBehavior::FailAfterHeartbeats(3)
+            } else {
+                RobotBehavior::Normal
+            };
+
+            spawn_robot(
+                RobotWorkerConfig {
+                    robot_id,
+                    heartbeat_interval: config.heartbeat_interval,
+                    zone_retry_interval: config.zone_retry_duration,
+                    idle_sleep_interval: config.idle_sleep_duration,
+                    task_execution_duration: config.task_execution_duration,
+                    behavior,
+                    verbose: true,
+                },
+                Arc::clone(&task_queue),
+                Arc::clone(&zone_manager),
+                Arc::clone(&monitor),
+                Arc::clone(&completed_tasks),
+                Arc::clone(&shutdown),
+            )
+        })
+        .collect();
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let completed = completed_tasks.lock().unwrap().len();
+        let robot_three_offline = monitor.status(3) == Some(RobotStatus::Offline);
+
+        if completed == total_tasks && robot_three_offline {
+            println!();
+            println!("[main] all tasks completed and offline detection observed");
+            break;
         }
-    });
 
-    robot_thread.join().unwrap();
-    println!("System shutdown gracefully."); [cite: 435]
+        if Instant::now() >= deadline {
+            println!();
+            println!("[main] demo deadline reached, beginning controlled shutdown");
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    *shutdown.lock().unwrap() = true;
+
+    let run_summaries: Vec<_> = robot_handles
+        .into_iter()
+        .map(|handle| handle.join().expect("robot thread should join cleanly"))
+        .collect();
+    let offline_events = monitor_handle
+        .join()
+        .expect("monitor thread should join cleanly");
+
+    println!();
+    println!("Run summary");
+    println!("-----------");
+    for summary in run_summaries {
+        println!(
+            "robot {} completed {} task(s){}",
+            summary.robot_id,
+            summary.completed_tasks,
+            if summary.simulated_failure {
+                " before simulated failure"
+            } else {
+                ""
+            }
+        );
+    }
+
+    let completed = completed_tasks.lock().unwrap();
+    println!("completed task ids: {:?}", completed.iter().map(|task| task.task_id).collect::<Vec<_>>());
+    println!("offline events: {:?}", offline_events);
+    println!("final zone occupancy: {:?}", zone_manager.snapshot());
 }

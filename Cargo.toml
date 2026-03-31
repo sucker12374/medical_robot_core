@@ -1,6 +1,6 @@
 [package]
-name = "medical_robot_core"
+name = "project_blaze"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
