@@ -1,0 +1,124 @@
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::Arc;
+
+use crate::task::{Task, TaskKind};
+use crate::task_queue::TaskQueue;
+
+/// when binary is run with --task-dispatcher, this function runs as child
+/// writes newline-delimited task descriptors to stdout (connected to parent pipe)
+
+/// format per line: <id>,<zone>,<kind_code> where kind_code is 0/1/2
+pub fn run_as_child_dispatcher(first_id: u32, count: u32) {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+
+    let zones = ["Zone-A", "Zone-B", "Zone-C"];
+    let kinds: &[(&str, u8)] = &[
+        ("Delivery", 0),
+        ("Disinfection", 1),
+        ("SurgicalAssist", 2),
+    ];
+
+    for i in 0..count {
+        let id = first_id + i;
+        let zone = zones[(i as usize) % zones.len()];
+        let (_, kind_code) = kinds[(i as usize) % kinds.len()];
+        writeln!(handle, "{id},{zone},{kind_code}").expect("pipe write failed");
+    }
+}
+
+/// spawns child process in dispatcher mode and returns handle to its stdout pipe
+pub struct DispatchProcess {
+    child: Child,
+    reader: BufReader<ChildStdout>,
+}
+
+impl DispatchProcess {
+    /// launch child that will emit count tasks starting from first_id
+    pub fn spawn(first_id: u32, count: u32) -> std::io::Result<Self> {
+        let exe = std::env::current_exe()?;
+
+        let mut child = Command::new(exe)
+            .args([
+                "--task-dispatcher",
+                &first_id.to_string(),
+                &count.to_string(),
+            ])
+            .stdout(Stdio::piped())  // pipe child stdout to parent
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let reader = BufReader::new(stdout);
+
+        Ok(Self { child, reader })
+    }
+
+    /// read all task lines from pipe and push them into queue
+    /// blocks until child closes stdout (eof)
+    pub fn drain_into_queue(&mut self, queue: &Arc<TaskQueue>) {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match self.reader.read_line(&mut line) {
+                Ok(0) => break, // eof
+                Ok(_) => {
+                    if let Some(task) = parse_task_line(line.trim()) {
+                        println!("[dispatch_process] received task {} for {} via pipe", task.id, task.target_zone);
+                        queue.add_task(task);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[dispatch_process] pipe read error: {e}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// wait for child process to exit and return its status
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+}
+
+fn parse_task_line(line: &str) -> Option<Task> {
+    let mut parts = line.splitn(3, ',');
+    let id: u32 = parts.next()?.trim().parse().ok()?;
+    let zone: String = parts.next()?.trim().to_string();
+    let kind_code: u8 = parts.next()?.trim().parse().ok()?;
+    let kind = match kind_code {
+        0 => TaskKind::Delivery,
+        1 => TaskKind::Disinfection,
+        2 => TaskKind::SurgicalAssist,
+        _ => return None,
+    };
+    Some(Task::new(id, zone, kind))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_task_line;
+    use crate::task::TaskKind;
+
+    #[test]
+    fn parse_delivery_task() {
+        let task = parse_task_line("7,Zone-B,0").unwrap();
+        assert_eq!(task.id, 7);
+        assert_eq!(task.target_zone, "Zone-B");
+        assert_eq!(task.kind, TaskKind::Delivery);
+    }
+
+    #[test]
+    fn parse_surgical_assist_task() {
+        let task = parse_task_line("99,Zone-C,2").unwrap();
+        assert_eq!(task.kind, TaskKind::SurgicalAssist);
+    }
+
+    #[test]
+    fn parse_invalid_line_returns_none() {
+        assert!(parse_task_line("bad,data").is_none());
+        assert!(parse_task_line("").is_none());
+    }
+}
