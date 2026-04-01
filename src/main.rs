@@ -2,6 +2,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use project_blaze::deadlock::run_deadlock_prevention_demo;
+use project_blaze::dispatch_process::DispatchProcess;
+use project_blaze::ffi_metrics::RobotMetrics;
 use project_blaze::monitor::{spawn_monitor_thread, HealthMonitor};
 use project_blaze::robot::{spawn_robot, RobotBehavior, RobotWorkerConfig};
 use project_blaze::task::{CompletedTask, Task, TaskKind};
@@ -12,6 +15,16 @@ use project_blaze::zone::ZoneManager;
 const ROBOT_COUNT: u32 = 3;
 
 fn main() {
+    // check if re-invoked as the child dispatcher process
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("--task-dispatcher") {
+            let first_id: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
+            let count: u32   = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+            project_blaze::dispatch_process::run_as_child_dispatcher(first_id, count);
+            return;
+        }
+    }
     let config = SimulationConfig {
         heartbeat_interval: Duration::from_millis(200),
         monitor_poll_interval: Duration::from_millis(150),
@@ -47,6 +60,29 @@ fn main() {
     println!("Contention demo: multiple tasks target Zone-A");
     println!("Timeout demo: robot 3 stops heartbeating after a few heartbeats");
     println!();
+
+    // unnamed pipe and child process
+    println!("[dispatch_process] spawning child dispatcher via unnamed pipe...");
+    let pipe_tasks_added = match DispatchProcess::spawn(100, 3) {
+        Ok(mut dp) => {
+            dp.drain_into_queue(&task_queue);
+            let _ = dp.wait();
+            3usize
+        }
+        Err(e) => {
+            eprintln!("[dispatch_process] could not spawn child: {e} (skipping)");
+            0
+        }
+    };
+    let total_tasks = total_static_tasks + pipe_tasks_added;
+    println!("[dispatch_process] {pipe_tasks_added} extra task(s) added via pipe");
+    println!("[dispatch_process] total tasks in queue: {total_tasks}");
+    println!();
+
+    // FFI / raw pointer metrics
+    let robot_metrics: Vec<Arc<Mutex<RobotMetrics>>> = (1..=ROBOT_COUNT)
+        .map(|id| Arc::new(Mutex::new(RobotMetrics::new(id))))
+        .collect();
 
     let monitor_handle = spawn_monitor_thread(
         Arc::clone(&monitor),
@@ -112,6 +148,15 @@ fn main() {
         .join()
         .expect("monitor thread should join cleanly");
 
+    // update FFI metrics counters from run summaries
+    for summary in &run_summaries {
+        let idx = (summary.robot_id - 1) as usize;
+        let m = robot_metrics[idx].lock().unwrap();
+        for _ in 0..summary.completed_tasks {
+            m.record_task_completed();
+        }
+    }
+    
     println!();
     println!("Run summary");
     println!("-----------");
@@ -132,4 +177,22 @@ fn main() {
     println!("completed task ids: {:?}", completed.iter().map(|task| task.task_id).collect::<Vec<_>>());
     println!("offline events: {:?}", offline_events);
     println!("final zone occupancy: {:?}", zone_manager.snapshot());
+
+    // print FFI metrics
+    println!();
+    println!("FFI Metrics (raw-pointer C-ABI counter per robot)");
+    println!("--------------------------------------------------");
+    for m in &robot_metrics {
+        println!("  {}", m.lock().unwrap());
+    }  // RobotMetrics drop here, metrics_free called, heap memory reclaimed.
+
+    // deadlock prevention demo
+    let (successes, contentions) = run_deadlock_prevention_demo();
+    println!();
+    println!("Deadlock Prevention summary");
+    println!("---------------------------");
+    println!("  Ordered-lock successes  : {successes}");
+    println!("  Contention retries      : {contentions}");
+    println!("  Deadlocks possible      : 0  (by construction)");
+}
 }
