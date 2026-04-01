@@ -41,6 +41,7 @@ pub fn spawn_robot(
     shutdown: Arc<Mutex<bool>>,
 ) -> JoinHandle<RobotRunSummary> {
     thread::spawn(move || {
+        // Each robot starts by telling the monitor that it is alive.
         monitor.register_robot(config.robot_id);
         let mut completed_count = 0usize;
         let mut heartbeat_count = 0usize;
@@ -55,6 +56,7 @@ pub fn spawn_robot(
                 break;
             }
 
+            // Robot 3 uses this path in the demo to show timeout detection.
             if should_fail(config.behavior, heartbeat_count) {
                 log(
                     config.verbose,
@@ -67,6 +69,7 @@ pub fn spawn_robot(
 
             maybe_send_heartbeat(&config, &monitor, &mut last_heartbeat_at, &mut heartbeat_count);
 
+            // OS concept: many worker threads compete for tasks from one shared queue.
             let Some(task) = task_queue.fetch_task() else {
                 thread::sleep(config.idle_sleep_interval);
                 continue;
@@ -108,6 +111,7 @@ pub fn spawn_robot(
                     &format!("requesting access to {}", task.target_zone),
                 );
 
+                // OS concept: only one robot may enter a zone at a time.
                 if zone_manager.try_acquire(&task.target_zone, config.robot_id) {
                     log(
                         config.verbose,
@@ -125,12 +129,16 @@ pub fn spawn_robot(
                 thread::sleep(config.zone_retry_interval);
             }
 
+            // Important design choice:
+            // the robot does not hold any mutex while it is doing the task.
+            // This keeps lock time short and avoids blocking other threads.
             thread::sleep(config.task_execution_duration);
 
             zone_manager
                 .release(&task.target_zone, config.robot_id)
                 .expect("robot should release only the zone it owns");
 
+            // Save a simple record so tests can prove every task finished once.
             completed_tasks
                 .lock()
                 .unwrap()
@@ -160,6 +168,7 @@ fn maybe_send_heartbeat(
     heartbeat_count: &mut usize,
 ) {
     if last_heartbeat_at.elapsed() >= config.heartbeat_interval {
+        // OS concept: periodic heartbeat for liveness detection.
         monitor.record_heartbeat(config.robot_id);
         *last_heartbeat_at = Instant::now();
         *heartbeat_count += 1;

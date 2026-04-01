@@ -11,7 +11,10 @@ struct MonitorState {
     statuses: HashMap<RobotId, RobotStatus>,
 }
 
-/// Tracks robot liveness without sharing locks with the task queue or zone manager.
+/// OS concept shown here: liveness monitoring in a concurrent system.
+///
+/// This monitor uses its own mutex, separate from the task queue and zone
+/// manager, so health checks do not block normal robot work.
 #[derive(Debug)]
 pub struct HealthMonitor {
     state: Mutex<MonitorState>,
@@ -55,6 +58,7 @@ impl HealthMonitor {
 
     pub fn check_timeouts_at(&self, now: Instant) -> Vec<RobotId> {
         let mut state = self.state.lock().unwrap();
+        // First collect every robot that timed out.
         let candidates: Vec<_> = state
             .last_heartbeat
             .iter()
@@ -65,6 +69,7 @@ impl HealthMonitor {
             })
             .collect();
 
+        // Then mark them offline. Doing it this way keeps the logic clear.
         for robot_id in &candidates {
             state.statuses.insert(*robot_id, RobotStatus::Offline);
         }
@@ -96,6 +101,8 @@ pub fn spawn_monitor_thread(
                 break;
             }
 
+            // OS concept: a monitor thread runs at the same time as worker
+            // threads and checks for timeout events.
             for robot_id in monitor.check_timeouts() {
                 if verbose {
                     println!(

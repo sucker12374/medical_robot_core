@@ -12,6 +12,7 @@ use project_blaze::zone::ZoneManager;
 const ROBOT_COUNT: u32 = 3;
 
 fn main() {
+    // These values control the demo timing and make the output easy to follow.
     let config = SimulationConfig {
         heartbeat_interval: Duration::from_millis(200),
         monitor_poll_interval: Duration::from_millis(150),
@@ -31,6 +32,10 @@ fn main() {
     ];
     let total_tasks = tasks.len();
 
+    // Shared state is split by concern:
+    // task queue lock for tasks,
+    // zone manager lock for room access,
+    // monitor lock for robot health.
     let task_queue = Arc::new(TaskQueue::from_tasks(tasks));
     let zone_manager = Arc::new(ZoneManager::new([
         "Zone-A".to_string(),
@@ -55,9 +60,11 @@ fn main() {
         true,
     );
 
+    // Spawn several robots so the demo shows real contention.
     let robot_handles: Vec<_> = (1..=ROBOT_COUNT)
         .map(|robot_id| {
             let behavior = if robot_id == 3 {
+                // One robot fails on purpose so the health monitor can mark it offline.
                 RobotBehavior::FailAfterHeartbeats(3)
             } else {
                 RobotBehavior::Normal
@@ -82,6 +89,8 @@ fn main() {
         })
         .collect();
 
+    // Wait until both key events happen:
+    // all tasks are done and one robot is marked offline.
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
         let completed = completed_tasks.lock().unwrap().len();
@@ -104,6 +113,7 @@ fn main() {
 
     *shutdown.lock().unwrap() = true;
 
+    // Join all threads for a clean shutdown.
     let run_summaries: Vec<_> = robot_handles
         .into_iter()
         .map(|handle| handle.join().expect("robot thread should join cleanly"))

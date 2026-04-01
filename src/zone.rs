@@ -3,7 +3,10 @@ use std::sync::Mutex;
 
 use crate::types::{RobotId, ZoneId};
 
-/// Mutex-protected zone occupancy table enforcing mutual exclusion.
+/// OS concept shown here: mutual exclusion for a shared hospital zone.
+///
+/// A zone can hold at most one robot id at a time. The mutex makes the check
+/// and update happen as one safe step.
 #[derive(Debug)]
 pub struct ZoneManager {
     occupancy: Mutex<HashMap<ZoneId, Option<RobotId>>>,
@@ -21,9 +24,11 @@ impl ZoneManager {
         let mut occupancy = self.occupancy.lock().unwrap();
         match occupancy.get_mut(zone_id) {
             Some(slot @ None) => {
+                // The zone was free, so this robot becomes the only owner.
                 *slot = Some(robot_id);
                 true
             }
+            // The zone is busy, so the caller must retry later.
             Some(Some(_)) => false,
             None => false,
         }
@@ -34,6 +39,7 @@ impl ZoneManager {
         match occupancy.get_mut(zone_id) {
             Some(slot) => match *slot {
                 Some(owner) if owner == robot_id => {
+                    // Give the zone back so another robot may enter.
                     *slot = None;
                     Ok(())
                 }

@@ -3,7 +3,10 @@ use std::sync::Mutex;
 
 use crate::task::Task;
 
-/// Thread-safe FIFO task queue for coordinating robot work.
+/// OS concept shown here: shared task scheduling with safe synchronization.
+///
+/// This queue is protected by a mutex so many robot threads can ask for work
+/// without taking the same task twice.
 #[derive(Debug)]
 pub struct TaskQueue {
     queue: Mutex<VecDeque<Task>>,
@@ -24,10 +27,14 @@ impl TaskQueue {
     }
 
     pub fn add_task(&self, task: Task) {
+        // Only hold the lock long enough to change the queue.
         self.queue.lock().unwrap().push_back(task);
     }
 
     pub fn fetch_task(&self) -> Option<Task> {
+        // OS concept: mutual exclusion on shared data.
+        // pop_front happens while the mutex is held, so one task can only be
+        // removed by one robot thread.
         self.queue.lock().unwrap().pop_front()
     }
 
