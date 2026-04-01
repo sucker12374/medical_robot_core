@@ -1,0 +1,152 @@
+/// internal counter layout, repr(c) for stable abi
+#[repr(C)]
+pub struct MetricsCounter {
+    tasks_completed: u64,
+    zone_retries: u64,
+    robot_id: u32,
+    _pad: u32,
+}
+
+/// allocate a new counter on the heap, return raw pointer
+#[no_mangle]
+pub extern "C" fn metrics_new(robot_id: u32) -> *mut MetricsCounter {
+    let counter = Box::new(MetricsCounter {
+        tasks_completed: 0,
+        zone_retries: 0,
+        robot_id,
+        _pad: 0,
+    });
+    Box::into_raw(counter) // leak ownership to caller
+}
+
+/// increment tasks_completed field
+/// ptr must be valid and not freed
+#[no_mangle]
+pub unsafe extern "C" fn metrics_increment_tasks(ptr: *mut MetricsCounter) {
+    (*ptr).tasks_completed += 1;
+}
+
+/// increment zone_retries field
+/// same as metrics_increment_tasks
+#[no_mangle]
+pub unsafe extern "C" fn metrics_increment_retries(ptr: *mut MetricsCounter) {
+    (*ptr).zone_retries += 1;
+}
+
+/// read current counter values
+/// same as metrics_increment_tasks
+#[no_mangle]
+pub unsafe extern "C" fn metrics_get(
+    ptr: *const MetricsCounter,
+) -> (u64, u64, u32) {
+    ((*ptr).tasks_completed, (*ptr).zone_retries, (*ptr).robot_id)
+}
+
+/// deallocate the counter (tolerates null)
+/// ptr must have been allocated by metrics_new and not freed before
+#[no_mangle]
+pub unsafe extern "C" fn metrics_free(ptr: *mut MetricsCounter) {
+    if ptr.is_null() {
+        return;
+    }
+    let _ = Box::from_raw(ptr); // box drops when function ends
+}
+
+/// raii wrapper that owns a metricscounter via c-abi functions
+pub struct RobotMetrics {
+    ptr: *mut MetricsCounter,
+}
+
+// pointer is owned exclusively and not shared across threads
+unsafe impl Send for RobotMetrics {}
+
+impl RobotMetrics {
+    pub fn new(robot_id: u32) -> Self {
+        Self {
+            ptr: metrics_new(robot_id),
+        }
+    }
+
+    pub fn record_task_completed(&self) {
+        // safety: ptr is valid for the lifetime of self
+        unsafe { metrics_increment_tasks(self.ptr) }
+    }
+
+    pub fn record_zone_retry(&self) {
+        unsafe { metrics_increment_retries(self.ptr) }
+    }
+
+    /// returns (tasks_completed, zone_retries, robot_id)
+    pub fn read(&self) -> (u64, u64, u32) {
+        unsafe { metrics_get(self.ptr) }
+    }
+}
+
+impl Drop for RobotMetrics {
+    fn drop(&mut self) {
+        // safety: ptr came from metrics_new and will be freed exactly once
+        unsafe { metrics_free(self.ptr) }
+    }
+}
+
+impl std::fmt::Display for RobotMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (tasks, retries, robot_id) = self.read();
+        write!(
+            f,
+            "robot {robot_id}: {tasks} task(s) completed, {retries} zone-retry event(s)"
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_counter_starts_at_zero() {
+        let m = RobotMetrics::new(42);
+        let (tasks, retries, robot_id) = m.read();
+        assert_eq!(tasks, 0);
+        assert_eq!(retries, 0);
+        assert_eq!(robot_id, 42);
+    }
+
+    #[test]
+    fn increment_tasks_reflects_in_read() {
+        let m = RobotMetrics::new(1);
+        m.record_task_completed();
+        m.record_task_completed();
+        m.record_task_completed();
+        let (tasks, _, _) = m.read();
+        assert_eq!(tasks, 3);
+    }
+
+    #[test]
+    fn increment_retries_reflects_in_read() {
+        let m = RobotMetrics::new(2);
+        for _ in 0..7 {
+            m.record_zone_retry();
+        }
+        let (_, retries, _) = m.read();
+        assert_eq!(retries, 7);
+    }
+
+    #[test]
+    fn metrics_free_null_is_safe() {
+        // safety: testing null tolerance
+        unsafe { metrics_free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn display_format_includes_robot_id_and_counts() {
+        let m = RobotMetrics::new(5);
+        m.record_task_completed();
+        m.record_zone_retry();
+        m.record_zone_retry();
+        let s = format!("{m}");
+        assert!(s.contains("robot 5"));
+        assert!(s.contains("1 task"));
+        assert!(s.contains("2 zone-retry"));
+    }
+}
