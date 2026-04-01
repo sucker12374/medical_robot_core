@@ -1,0 +1,232 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use crate::types::{RobotId, ZoneId};
+
+/// holds exclusive access to two zones acquired in canonical (sorted) order
+/// using a single lock, so circular wait is impossible
+pub struct OrderedZoneGuard<'a> {
+    acquired: Vec<ZoneId>,
+    occupancy: MutexGuard<'a, HashMap<ZoneId, Option<RobotId>>>,
+    robot_id: RobotId,
+}
+
+impl<'a> OrderedZoneGuard<'a> {
+    /// try to acquire zone_a and zone_b for robot_id
+    /// returns None if either zone is already occupied
+    /// acquires zones in sorted order to prevent deadlock
+    pub fn try_acquire(
+        occupancy_mutex: &'a Mutex<HashMap<ZoneId, Option<RobotId>>>,
+        zone_a: &str,
+        zone_b: &str,
+        robot_id: RobotId,
+    ) -> Option<Self> {
+        let mut zones = [zone_a.to_string(), zone_b.to_string()];
+        zones.sort();  // total order on zone names
+
+        let mut occupancy = occupancy_mutex.lock().unwrap();
+
+        let both_free = zones
+            .iter()
+            .all(|z| occupancy.get(z).copied().flatten().is_none());
+
+        if !both_free {
+            return None;
+        }
+
+        for z in &zones {
+            occupancy.insert(z.clone(), Some(robot_id));
+        }
+
+        Some(Self {
+            acquired: zones.to_vec(),
+            occupancy,
+            robot_id,
+        })
+    }
+
+    pub fn held_zones(&self) -> &[ZoneId] {
+        &self.acquired
+    }
+}
+
+impl Drop for OrderedZoneGuard<'_> {
+    fn drop(&mut self) {
+        for z in &self.acquired {
+            if let Some(slot) = self.occupancy.get_mut(z) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+/// counts successful ordered acquisitions vs contention events
+#[derive(Debug, Default)]
+pub struct DeadlockStats {
+    inner: Mutex<StatsInner>,
+}
+
+#[derive(Debug, Default)]
+struct StatsInner {
+    safe_acquisitions: u64,
+    contention_events: u64,
+}
+
+impl DeadlockStats {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn record_success(&self) {
+        self.inner.lock().unwrap().safe_acquisitions += 1;
+    }
+
+    pub fn record_contention(&self) {
+        self.inner.lock().unwrap().contention_events += 1;
+    }
+
+    pub fn snapshot(&self) -> (u64, u64) {
+        let s = self.inner.lock().unwrap();
+        (s.safe_acquisitions, s.contention_events)
+    }
+}
+
+/// runs a short demo with two robots competing for two zones
+/// returns (successes, contentions)
+pub fn run_deadlock_prevention_demo() -> (u64, u64) {
+    use std::thread;
+    use std::time::Duration;
+
+    println!("\n[deadlock_prevention] starting ordered-lock demo");
+    println!("[deadlock_prevention] two robots competing for Zone-X and Zone-Y");
+
+    let occupancy: Arc<Mutex<HashMap<ZoneId, Option<RobotId>>>> = Arc::new(Mutex::new({
+        let mut m = HashMap::new();
+        m.insert("Zone-X".to_string(), None);
+        m.insert("Zone-Y".to_string(), None);
+        m
+    }));
+
+    let stats = DeadlockStats::new();
+
+    let handles: Vec<_> = [1u32, 2u32]
+        .into_iter()
+        .map(|robot_id| {
+            let occ = Arc::clone(&occupancy);
+            let stats = Arc::clone(&stats);
+            thread::spawn(move || {
+                for attempt in 0..5u32 {
+                    loop {
+                        match OrderedZoneGuard::try_acquire(&occ, "Zone-X", "Zone-Y", robot_id) {
+                            Some(guard) => {
+                                stats.record_success();
+                                println!(
+                                    "[deadlock_prevention] robot {robot_id} attempt {attempt}: \
+                                     acquired {:?} (ordered) — no deadlock possible",
+                                    guard.held_zones()
+                                );
+                                thread::sleep(Duration::from_millis(20));
+                                break;
+                            }
+                            None => {
+                                stats.record_contention();
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let (successes, contentions) = stats.snapshot();
+    println!(
+        "[deadlock_prevention] demo complete — successes: {successes}, contention retries: {contentions}"
+    );
+    (successes, contentions)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    use super::OrderedZoneGuard;
+
+    fn two_zone_occupancy() -> Arc<Mutex<HashMap<String, Option<u32>>>> {
+        Arc::new(Mutex::new({
+            let mut m = HashMap::new();
+            m.insert("Zone-X".to_string(), None);
+            m.insert("Zone-Y".to_string(), None);
+            m
+        }))
+    }
+
+    #[test]
+    fn ordered_acquire_succeeds_when_both_free() {
+        let occ = two_zone_occupancy();
+        let guard = OrderedZoneGuard::try_acquire(&occ, "Zone-X", "Zone-Y", 1);
+        assert!(guard.is_some());
+        let g = guard.unwrap();
+        assert_eq!(g.held_zones(), &["Zone-X", "Zone-Y"]);
+    }
+
+    #[test]
+    fn ordered_acquire_fails_when_zone_occupied() {
+        let occ = two_zone_occupancy();
+        let _guard1 = OrderedZoneGuard::try_acquire(&occ, "Zone-X", "Zone-Y", 1).unwrap();
+        let guard2 = OrderedZoneGuard::try_acquire(&occ, "Zone-X", "Zone-Y", 2);
+        assert!(guard2.is_none());
+    }
+
+    #[test]
+    fn zones_released_after_guard_drop() {
+        let occ = two_zone_occupancy();
+        {
+            let _g = OrderedZoneGuard::try_acquire(&occ, "Zone-X", "Zone-Y", 1).unwrap();
+        }
+        let g2 = OrderedZoneGuard::try_acquire(&occ, "Zone-X", "Zone-Y", 2);
+        assert!(g2.is_some());
+    }
+
+    #[test]
+    fn concurrent_acquisitions_never_double_assign() {
+        let occ = two_zone_occupancy();
+        let double_occupancy_detected = Arc::new(Mutex::new(false));
+
+        let handles: Vec<_> = (1u32..=8)
+            .map(|robot_id| {
+                let occ = Arc::clone(&occ);
+                let detected = Arc::clone(&double_occupancy_detected);
+                thread::spawn(move || {
+                    for _ in 0..10 {
+                        loop {
+                            if let Some(g) =
+                                OrderedZoneGuard::try_acquire(&occ, "Zone-X", "Zone-Y", robot_id)
+                            {
+                                let snap = occ.lock().unwrap();
+                                for zone in g.held_zones() {
+                                    if snap.get(zone).copied().flatten() != Some(robot_id) {
+                                        *detected.lock().unwrap() = true;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(!*double_occupancy_detected.lock().unwrap());
+    }
+}
